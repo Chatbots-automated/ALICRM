@@ -2,6 +2,7 @@
   "name": "stripe-metrics-api",
   "version": "1.0.0",
   "private": true,
+
   "engines": { "node": "18.x" },
 
   "scripts": {
@@ -15,9 +16,7 @@
   "vercel": {
     "version": 2,
     "functions": {
-      "api/**/*.js": { "runtime": "nodejs18.x" },
-      "api/**/*.mjs": { "runtime": "nodejs18.x" },
-      "api/**/*.ts":  { "runtime": "nodejs18.x" }
+      "api/**/*.js": { "runtime": "nodejs18.x" }
     }
   }
 }
