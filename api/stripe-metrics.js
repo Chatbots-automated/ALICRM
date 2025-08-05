@@ -21,52 +21,61 @@ module.exports = async (req, res) => {
   if (req.method === 'OPTIONS') return res.status(200).end();
 
   try {
-    /* ── STEP A · Active subscriptions → MRR ───────────────────────────── */
-    let mrrCents   = 0;
+    /* ─────────────────  STEP A · Active subscriptions → MRR  ──────────── */
+    let mrrCents = 0;
+    let subAfter;
     const subsSample = [];
 
-    console.log('STEP A: walking all active subscriptions');
-    for await (const sub of stripe.subscriptions
-      .list({ status: 'active', limit: 100 })
-      .autoPagingEach()
-    ) {
-      if (subsSample.length < 3) subsSample.push(sub);
-
-      sub.items.data.forEach(it => {
-        const { unit_amount, interval, interval_count } = it.price;
-        if (!unit_amount || !interval) return;
-
-        const monthly = interval === 'month'
-          ? unit_amount
-          : unit_amount / (interval_count * (interval === 'year' ? 12 : 1));
-
-        mrrCents += monthly * (it.quantity || 1);
+    do {
+      const page = await stripe.subscriptions.list({
+        status: 'active',
+        limit : 100,                 // Stripe hard-limit
+        starting_after: subAfter,
       });
-    }
-    console.log(`  → Computed MRR (cents): ${mrrCents}`);
 
-    /* ── STEP B · ALL PaymentIntents (auto-paginate) → revenue ─────────── */
+      page.data.forEach(sub => {
+        if (subsSample.length < 3) subsSample.push(sub);
+        sub.items.data.forEach(it => {
+          const { unit_amount, interval, interval_count } = it.price;
+          if (!unit_amount || !interval) return;
+          const monthly = interval === 'month'
+            ? unit_amount
+            : unit_amount / (interval_count * (interval === 'year' ? 12 : 1));
+          mrrCents += monthly * (it.quantity || 1);
+        });
+      });
+
+      subAfter = page.has_more ? page.data.at(-1).id : undefined;
+    } while (subAfter);
+
+    /* ───────────  STEP B · PaymentIntents (manual pagination) ─────────── */
     const monthStart = monthStartUtc();
     const piSample   = [];
     let allTimeCents = 0;
     let mtdCents     = 0;
-    let piCount      = 0;
+    let piAfter;
+    let totalPI      = 0;
 
-    console.log('STEP B: walking ALL PaymentIntents with autoPagingEach()');
-    for await (const pi of stripe.paymentIntents
-      .list({ limit: 100 })
-      .autoPagingEach()
-    ) {
-      piCount++;
-      if (pi.status !== 'succeeded') continue;
+    console.log('STEP B: fetching PaymentIntents 100 at a time');
+    do {
+      const page = await stripe.paymentIntents.list({
+        limit : 100,                 // 100 is the maximum allowed
+        starting_after: piAfter,
+      });
 
-      if (piSample.length < 5) piSample.push(pi);
-      allTimeCents += pi.amount_received;
-      if (pi.created >= monthStart) mtdCents += pi.amount_received;
-    }
-    console.log(`  → Total PaymentIntents walked: ${piCount}`);
+      totalPI += page.data.length;
+      page.data.forEach(pi => {
+        if (pi.status !== 'succeeded') return;
+        if (piSample.length < 5) piSample.push(pi);
+        allTimeCents += pi.amount_received;
+        if (pi.created >= monthStart) mtdCents += pi.amount_received;
+      });
 
-    /* ── Final payload ─────────────────────────────────────────────────── */
+      piAfter = page.has_more ? page.data.at(-1).id : undefined;
+    } while (piAfter);
+    console.log(`  → Total PaymentIntents walked: ${totalPI}`);
+
+    /* ────────────────────────────  Final payload  ─────────────────────── */
     const payload = {
       mrr_usd                  : toUsd(mrrCents),
       month_to_date_revenue_usd: toUsd(mtdCents),
