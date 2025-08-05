@@ -15,70 +15,64 @@ const monthStartUtc = () => {
 };
 
 module.exports = async (req, res) => {
-  /* simple CORS */
+  /* CORS */
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
   if (req.method === 'OPTIONS') return res.status(200).end();
 
   try {
-    /* ── STEP A · Active subscriptions → MRR ───────────────── */
-    let mrrCents = 0;
-    let subAfter;
+    /* ── STEP A · Active subscriptions → MRR ───────────────────────────── */
+    let mrrCents   = 0;
     const subsSample = [];
 
-    do {
-      const page = await stripe.subscriptions.list({
-        status: 'active',
-        limit : 100,
-        starting_after: subAfter,
+    console.log('STEP A: walking all active subscriptions');
+    for await (const sub of stripe.subscriptions
+      .list({ status: 'active', limit: 100 })
+      .autoPagingEach()
+    ) {
+      if (subsSample.length < 3) subsSample.push(sub);
+
+      sub.items.data.forEach(it => {
+        const { unit_amount, interval, interval_count } = it.price;
+        if (!unit_amount || !interval) return;
+
+        const monthly = interval === 'month'
+          ? unit_amount
+          : unit_amount / (interval_count * (interval === 'year' ? 12 : 1));
+
+        mrrCents += monthly * (it.quantity || 1);
       });
+    }
+    console.log(`  → Computed MRR (cents): ${mrrCents}`);
 
-      page.data.forEach(sub => {
-        if (subsSample.length < 3) subsSample.push(sub);
-        sub.items.data.forEach(it => {
-          const { unit_amount, interval, interval_count } = it.price;
-          if (!unit_amount || !interval) return;
-          const monthly =
-            interval === 'month'
-              ? unit_amount
-              : unit_amount / (interval_count * (interval === 'year' ? 12 : 1));
-          mrrCents += monthly * (it.quantity || 1);
-        });
-      });
-
-      subAfter = page.has_more ? page.data.at(-1).id : undefined;
-    } while (subAfter);
-
-    /* ── STEP B · PaymentIntents (filter inside loop) ───────── */
+    /* ── STEP B · ALL PaymentIntents (auto-paginate) → revenue ─────────── */
     const monthStart = monthStartUtc();
-    let intentAfter;
-    const piSample = [];
+    const piSample   = [];
     let allTimeCents = 0;
-    let mtdCents    = 0;
+    let mtdCents     = 0;
+    let piCount      = 0;
 
-    do {
-      const page = await stripe.paymentIntents.list({
-        limit : 100,
-        starting_after: intentAfter,
-      });
+    console.log('STEP B: walking ALL PaymentIntents with autoPagingEach()');
+    for await (const pi of stripe.paymentIntents
+      .list({ limit: 100 })
+      .autoPagingEach()
+    ) {
+      piCount++;
+      if (pi.status !== 'succeeded') continue;
 
-      page.data.forEach(pi => {
-        if (pi.status !== 'succeeded') return;           // ← filter here
-        if (piSample.length < 5) piSample.push(pi);      // sample log
-        allTimeCents += pi.amount_received;
-        if (pi.created >= monthStart) mtdCents += pi.amount_received;
-      });
+      if (piSample.length < 5) piSample.push(pi);
+      allTimeCents += pi.amount_received;
+      if (pi.created >= monthStart) mtdCents += pi.amount_received;
+    }
+    console.log(`  → Total PaymentIntents walked: ${piCount}`);
 
-      intentAfter = page.has_more ? page.data.at(-1).id : undefined;
-    } while (intentAfter);
-
-    /* ── Final payload ─────────────────────────────────────── */
+    /* ── Final payload ─────────────────────────────────────────────────── */
     const payload = {
-      mrr_usd                 : toUsd(mrrCents),
+      mrr_usd                  : toUsd(mrrCents),
       month_to_date_revenue_usd: toUsd(mtdCents),
-      all_time_revenue_usd    : toUsd(allTimeCents),
-      payment_intents_sample  : piSample,
-      subscriptions_sample    : subsSample,
+      all_time_revenue_usd     : toUsd(allTimeCents),
+      payment_intents_sample   : piSample,
+      subscriptions_sample     : subsSample,
     };
 
     console.log('Stripe metrics payload', JSON.stringify(payload, null, 2));
