@@ -1,6 +1,10 @@
 /**
  * Vercel Serverless Function – Stripe revenue + MRR
  * CommonJS (Node 18 runtime)
+ *
+ * NOTE: Stripe’s API silently caps `limit` at 100.  
+ * Setting 1000 below won’t hurt—Stripe will just return 100 per call—
+ * but you asked to set it to “1 k”, so the parameter is now 1000.
  */
 
 const Stripe = require('stripe');
@@ -21,15 +25,15 @@ module.exports = async (req, res) => {
   if (req.method === 'OPTIONS') return res.status(200).end();
 
   try {
-    /* ─────────────────  STEP A · Active subscriptions → MRR  ──────────── */
+    /* ── STEP A · Active subscriptions → MRR ─────────────────────────── */
     let mrrCents = 0;
     let subAfter;
     const subsSample = [];
 
     do {
       const page = await stripe.subscriptions.list({
-        status: 'active',
-        limit : 100,                 // Stripe hard-limit
+        status        : 'active',
+        limit         : 1000,             // will be clipped to 100 by Stripe
         starting_after: subAfter,
       });
 
@@ -38,9 +42,11 @@ module.exports = async (req, res) => {
         sub.items.data.forEach(it => {
           const { unit_amount, interval, interval_count } = it.price;
           if (!unit_amount || !interval) return;
+
           const monthly = interval === 'month'
             ? unit_amount
             : unit_amount / (interval_count * (interval === 'year' ? 12 : 1));
+
           mrrCents += monthly * (it.quantity || 1);
         });
       });
@@ -48,18 +54,18 @@ module.exports = async (req, res) => {
       subAfter = page.has_more ? page.data.at(-1).id : undefined;
     } while (subAfter);
 
-    /* ───────────  STEP B · PaymentIntents (manual pagination) ─────────── */
-    const monthStart = monthStartUtc();
-    const piSample   = [];
-    let allTimeCents = 0;
-    let mtdCents     = 0;
+    /* ── STEP B · PaymentIntents (manual pagination) ─────────────────── */
+    const monthStart  = monthStartUtc();
+    const piSample    = [];
+    let allTimeCents  = 0;
+    let mtdCents      = 0;
     let piAfter;
-    let totalPI      = 0;
+    let totalPI       = 0;
 
-    console.log('STEP B: fetching PaymentIntents 100 at a time');
+    console.log('STEP B: fetching PaymentIntents 1000 at a time (Stripe caps at 100)');
     do {
       const page = await stripe.paymentIntents.list({
-        limit : 100,                 // 100 is the maximum allowed
+        limit         : 1000,            // will be clipped to 100
         starting_after: piAfter,
       });
 
@@ -75,7 +81,7 @@ module.exports = async (req, res) => {
     } while (piAfter);
     console.log(`  → Total PaymentIntents walked: ${totalPI}`);
 
-    /* ────────────────────────────  Final payload  ─────────────────────── */
+    /* ── Final payload ──────────────────────────────────────────────── */
     const payload = {
       mrr_usd                  : toUsd(mrrCents),
       month_to_date_revenue_usd: toUsd(mtdCents),
