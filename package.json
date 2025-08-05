@@ -19,7 +19,7 @@
   "vercel": {
     "version": 2,
     "functions": {
-      "api/**/*.js": { "runtime": "nodejs18.x" },   // or .ts if you keep TypeScript files
+      "api/**/*.js": { "runtime": "nodejs18.x" },   
       "api/**/*.ts": { "runtime": "nodejs18.x" }
     }
   }
