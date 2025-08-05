@@ -1,6 +1,10 @@
 /**
  * Vercel Serverless Function – Stripe revenue + MRR
  * CommonJS (Node 18 runtime)
+ *
+ * NOTE  Stripe caps every list call at 100, even if `limit` is set higher.
+ * The loops below page until `has_more` is false, so the entire dataset
+ * (subscriptions and payment-intents) is processed.
  */
 
 const Stripe = require('stripe');
@@ -11,7 +15,9 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
 const toUsd = cents => (cents / 100).toFixed(2);
 const monthStartUtc = () => {
   const now = new Date();
-  return Math.floor(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1) / 1000);
+  return Math.floor(
+    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1) / 1000
+  );
 };
 
 module.exports = async (req, res) => {
@@ -21,26 +27,26 @@ module.exports = async (req, res) => {
   if (req.method === 'OPTIONS') return res.status(200).end();
 
   try {
-    /* ── STEP A · Subscriptions → MRR  (manual pagination) ────────────── */
+    /* ───────────────── STEP A · Subscriptions → MRR ─────────────────── */
     let mrrCents   = 0;
     let subAfter;
     let subsPages  = 0;
     let subsSeen   = 0;
-    const subsSample = [];
+    const subsSample = [];          // now holds ALL active subs
 
-    console.log('STEP A: fetching Subscriptions with limit=1000 (Stripe caps at 100)');
+    console.log('STEP A: fetching Subscriptions (limit=1000, Stripe caps at 100)');
     do {
       const page = await stripe.subscriptions.list({
-        status        : 'active',      // change to 'all' if you need every status
-        limit         : 1000,          // Stripe clips to 100
+        status        : 'active',   // change to 'all' for every status
+        limit         : 1000,       // Stripe clips to 100
         starting_after: subAfter,
       });
 
       subsPages += 1;
       subsSeen  += page.data.length;
+      subsSample.push(...page.data);                // keep every sub
 
       page.data.forEach(sub => {
-        if (subsSample.length < 5) subsSample.push(sub); // keep first 5
         sub.items.data.forEach(it => {
           const { unit_amount, interval, interval_count } = it.price;
           if (!unit_amount || !interval) return;
@@ -58,19 +64,19 @@ module.exports = async (req, res) => {
     console.log(`  → subscription pages walked : ${subsPages}`);
     console.log(`  → subscriptions seen        : ${subsSeen}`);
 
-    /* ── STEP B · PaymentIntents pagination (unchanged) ──────────────── */
-    const monthStart  = monthStartUtc();
-    const piSample    = [];
-    let allTimeCents  = 0;
-    let mtdCents      = 0;
+    /* ───────── STEP B · PaymentIntents pagination (unchanged) ───────── */
+    const monthStart = monthStartUtc();
+    const piSample   = [];
+    let allTimeCents = 0;
+    let mtdCents     = 0;
     let piAfter;
     let piPages = 0;
     let piSeen  = 0;
 
-    console.log('STEP B: fetching PaymentIntents with limit=1000 (capped at 100)');
+    console.log('STEP B: fetching PaymentIntents (limit=1000, capped at 100)');
     do {
       const page = await stripe.paymentIntents.list({
-        limit         : 1000,          // Stripe clips to 100
+        limit         : 1000,        // Stripe clips to 100
         starting_after: piAfter,
       });
 
@@ -79,7 +85,7 @@ module.exports = async (req, res) => {
 
       page.data.forEach(pi => {
         if (pi.status !== 'succeeded' && pi.amount_received === 0) return;
-        if (piSample.length < 5) piSample.push(pi);
+        if (piSample.length < 5) piSample.push(pi);   // keep first 5 for preview
         allTimeCents += pi.amount_received;
         if (pi.created >= monthStart) mtdCents += pi.amount_received;
       });
@@ -90,16 +96,16 @@ module.exports = async (req, res) => {
     console.log(`  → payment-intent pages walked : ${piPages}`);
     console.log(`  → payment-intents seen        : ${piSeen}`);
 
-    /* ── Final payload ──────────────────────────────────────────────── */
+    /* ─────────────────────────── Final payload ─────────────────────── */
     const payload = {
       /* revenue */
       mrr_usd                  : toUsd(mrrCents),
       month_to_date_revenue_usd: toUsd(mtdCents),
       all_time_revenue_usd     : toUsd(allTimeCents),
 
-      /* samples */
+      /* full lists / samples */
+      subscriptions            : subsSample,  // ⬅️ ALL active subs
       payment_intents_sample   : piSample,
-      subscriptions_sample     : subsSample,
 
       /* diagnostics */
       subs_pages_walked        : subsPages,
