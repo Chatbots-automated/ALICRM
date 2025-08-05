@@ -1,10 +1,10 @@
 /**
- * Vercel Serverless Function – Stripe revenue + MRR
+ * Vercel Serverless Function – Stripe revenue + MRR (+ customer names)
  * CommonJS (Node 18 runtime)
  *
- * NOTE  Stripe caps every list call at 100, even if `limit` is set higher.
- * The loops below page until `has_more` is false, so the entire dataset
- * (subscriptions and payment-intents) is processed.
+ * Stripe caps every list call at 100, even if you pass 1000.
+ * We keep paginating until `has_more` is false, so the full dataset
+ * is processed.
  */
 
 const Stripe = require('stripe');
@@ -15,9 +15,7 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
 const toUsd = cents => (cents / 100).toFixed(2);
 const monthStartUtc = () => {
   const now = new Date();
-  return Math.floor(
-    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1) / 1000
-  );
+  return Math.floor(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1) / 1000);
 };
 
 module.exports = async (req, res) => {
@@ -27,26 +25,39 @@ module.exports = async (req, res) => {
   if (req.method === 'OPTIONS') return res.status(200).end();
 
   try {
-    /* ───────────────── STEP A · Subscriptions → MRR ─────────────────── */
+    /* ── STEP A · Subscriptions (+customer) → MRR ───────────────────── */
     let mrrCents   = 0;
     let subAfter;
     let subsPages  = 0;
     let subsSeen   = 0;
-    const subsSample = [];          // now holds ALL active subs
+    const subscriptions = [];            // full enriched list
 
-    console.log('STEP A: fetching Subscriptions (limit=1000, Stripe caps at 100)');
+    console.log('STEP A: fetching Subscriptions (expand customer)');
     do {
       const page = await stripe.subscriptions.list({
-        status        : 'active',   // change to 'all' for every status
-        limit         : 1000,       // Stripe clips to 100
+        status        : 'active',      // change to 'all' if you need every status
+        limit         : 1000,          // Stripe clips to 100
         starting_after: subAfter,
+        expand        : ['data.customer']  // ⭐ include customer objects
       });
 
       subsPages += 1;
       subsSeen  += page.data.length;
-      subsSample.push(...page.data);                // keep every sub
 
       page.data.forEach(sub => {
+        // Grab customer name (or email fallback)
+        let customer_name = null;
+        if (typeof sub.customer === 'object' && sub.customer !== null) {
+          customer_name = sub.customer.name || sub.customer.email || null;
+        }
+
+        // Enrich subscription object (shallow clone + new field)
+        subscriptions.push({
+          ...sub,
+          customer_name
+        });
+
+        // MRR math
         sub.items.data.forEach(it => {
           const { unit_amount, interval, interval_count } = it.price;
           if (!unit_amount || !interval) return;
@@ -64,11 +75,11 @@ module.exports = async (req, res) => {
     console.log(`  → subscription pages walked : ${subsPages}`);
     console.log(`  → subscriptions seen        : ${subsSeen}`);
 
-    /* ───────── STEP B · PaymentIntents pagination (unchanged) ───────── */
-    const monthStart = monthStartUtc();
-    const piSample   = [];
-    let allTimeCents = 0;
-    let mtdCents     = 0;
+    /* ── STEP B · PaymentIntents pagination (unchanged) ─────────────── */
+    const monthStart  = monthStartUtc();
+    const piSample    = [];
+    let allTimeCents  = 0;
+    let mtdCents      = 0;
     let piAfter;
     let piPages = 0;
     let piSeen  = 0;
@@ -76,7 +87,7 @@ module.exports = async (req, res) => {
     console.log('STEP B: fetching PaymentIntents (limit=1000, capped at 100)');
     do {
       const page = await stripe.paymentIntents.list({
-        limit         : 1000,        // Stripe clips to 100
+        limit         : 1000,          // Stripe clips to 100
         starting_after: piAfter,
       });
 
@@ -85,7 +96,7 @@ module.exports = async (req, res) => {
 
       page.data.forEach(pi => {
         if (pi.status !== 'succeeded' && pi.amount_received === 0) return;
-        if (piSample.length < 5) piSample.push(pi);   // keep first 5 for preview
+        if (piSample.length < 5) piSample.push(pi);
         allTimeCents += pi.amount_received;
         if (pi.created >= monthStart) mtdCents += pi.amount_received;
       });
@@ -96,22 +107,22 @@ module.exports = async (req, res) => {
     console.log(`  → payment-intent pages walked : ${piPages}`);
     console.log(`  → payment-intents seen        : ${piSeen}`);
 
-    /* ─────────────────────────── Final payload ─────────────────────── */
+    /* ── Final payload ─────────────────────────────────────────────── */
     const payload = {
       /* revenue */
       mrr_usd                  : toUsd(mrrCents),
       month_to_date_revenue_usd: toUsd(mtdCents),
       all_time_revenue_usd     : toUsd(allTimeCents),
 
-      /* full lists / samples */
-      subscriptions            : subsSample,  // ⬅️ ALL active subs
-      payment_intents_sample   : piSample,
+      /* data */
+      subscriptions,                // ← full list, each with `customer_name`
+      payment_intents_sample: piSample,
 
       /* diagnostics */
-      subs_pages_walked        : subsPages,
-      subs_seen                : subsSeen,
-      pi_pages_walked          : piPages,
-      pi_seen                  : piSeen,
+      subs_pages_walked : subsPages,
+      subs_seen         : subsSeen,
+      pi_pages_walked   : piPages,
+      pi_seen           : piSeen,
     };
 
     console.log('Stripe metrics payload', JSON.stringify(payload, null, 2));
