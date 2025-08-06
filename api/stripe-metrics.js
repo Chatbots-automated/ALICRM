@@ -25,18 +25,18 @@ const PAYPAL_CLIENT_ID =
   'AacO4zdSVS1h98mUove2VbJ-B6hBwv6SVV0ofRKer0gVwgnL7cZSB4_F3PlV6bhHFaDoAk6rs3Qsw2lw';
 const PAYPAL_CLIENT_SECRET =
   'EJIZYylz8gxmxXD5ZN4ODJP3fCP-vSi28C_7zsZdBYXx5d2VGihVryuTcxnmhVeoXL_om8T0f6G7Vro0';
+const PAYPAL_BASE = 'https://api-m.paypal.com';           // LIVE endpoint
 
-const PAYPAL_BASE = 'https://api-m.paypal.com'; // LIVE endpoint
-
-async function paypalToken() {
+/* ---------- OAuth token ---------- */
+async function paypalToken () {
   const creds = Buffer.from(
-    ${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}
+    `${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`
   ).toString('base64');
 
-  const r = await fetch(${PAYPAL_BASE}/v1/oauth2/token, {
+  const r = await fetch(`${PAYPAL_BASE}/v1/oauth2/token`, {
     method : 'POST',
     headers: {
-      Authorization : Basic ${creds},
+      Authorization : `Basic ${creds}`,
       'Content-Type': 'application/x-www-form-urlencoded',
     },
     body: 'grant_type=client_credentials',
@@ -44,13 +44,15 @@ async function paypalToken() {
 
   if (!r.ok) {
     console.error('PayPal OAuth error', r.status, await r.text());
-    throw new Error(PayPal token error — HTTP ${r.status});
+    throw new Error(`PayPal token error — HTTP ${r.status}`);
   }
-  const { access_token } = await r.json();
-  return access_token;
+  return (await r.json()).access_token;
 }
 
-const ppHeaders = t => ({ Authorization: Bearer ${t}, 'Content-Type': 'application/json' });
+const ppHeaders = t => ({
+  Authorization : `Bearer ${t}`,
+  'Content-Type': 'application/json',
+});
 
 /* ───────────────────────────────────────────────────────────── */
 module.exports = async (req, res) => {
@@ -67,7 +69,7 @@ module.exports = async (req, res) => {
     do {
       const page = await stripe.subscriptions.list({
         status        : 'all',
-        limit         : 1000,           // Stripe clips to 100
+        limit         : 1000,           // Stripe caps at 100
         starting_after: sAfter,
         expand        : ['data.customer'],
       });
@@ -84,15 +86,15 @@ module.exports = async (req, res) => {
         stripeSubs.push({ ...sub, customer_name });
 
         sub.items.data.forEach(it => {
-          /* — sanitize amount — */
+          // sanitize amount
           let cents = it.price.unit_amount;
           if (cents == null) cents = Number(it.price.unit_amount_decimal);
-          if (!Number.isFinite(cents) || cents === 0) return;       // skip free / bad
+          if (!Number.isFinite(cents) || cents === 0) return;
 
           const { interval, interval_count } = it.price;
-          if (!interval) return;                                     // defensive
+          if (!interval) return;
 
-          const ic = Number(interval_count) || 1;                    // guard divide-by-0
+          const ic = Number(interval_count) || 1;
           const monthly = interval === 'month'
             ? cents
             : cents / (ic * (interval === 'year' ? 12 : 1));
@@ -112,7 +114,7 @@ module.exports = async (req, res) => {
 
     do {
       const page = await stripe.paymentIntents.list({
-        limit         : 1000,
+        limit         : 1000,          // Stripe caps to 100
         starting_after: piAfter,
       });
 
@@ -121,6 +123,7 @@ module.exports = async (req, res) => {
       page.data.forEach(pi => {
         if (pi.status !== 'succeeded' || pi.amount_received === 0) return;
         if (piSample.length < 5) piSample.push(pi);
+
         stripeAllTimeC += pi.amount_received;
         if (pi.created >= monthStart) stripeMTDC += pi.amount_received;
       });
@@ -129,17 +132,17 @@ module.exports = async (req, res) => {
     } while (piAfter);
 
     /* ========== 2. PAYPAL  active subscriptions → MRR ========== */
-    const ppToken        = await paypalToken();
-    const planCache      = new Map();
-    const ppSubs         = [];
+    const ppToken   = await paypalToken();
+    const planCache = new Map();
+    const ppSubs    = [];
     let ppPage = 1, ppPages = 0, ppSeen = 0;
     let paypalMRRCents = 0;
 
     while (true) {
-      const listURL = ${PAYPAL_BASE}/v1/billing/subscriptions
-                    + ?status=ACTIVE&page_size=20&page=${ppPage};
+      const listURL = `${PAYPAL_BASE}/v1/billing/subscriptions`
+                    + `?status=ACTIVE&page_size=20&page=${ppPage}`;
       const listRes = await fetch(listURL, { headers: ppHeaders(ppToken) });
-      if (!listRes.ok) throw new Error(PayPal list error — HTTP ${listRes.status});
+      if (!listRes.ok) throw new Error(`PayPal list error — HTTP ${listRes.status}`);
       const { subscriptions: batch = [] } = await listRes.json();
       if (batch.length === 0) break;
 
@@ -147,7 +150,7 @@ module.exports = async (req, res) => {
 
       for (const { id } of batch) {
         const dRes = await fetch(
-          ${PAYPAL_BASE}/v1/billing/subscriptions/${id},
+          `${PAYPAL_BASE}/v1/billing/subscriptions/${id}`,
           { headers: ppHeaders(ppToken) }
         );
         if (!dRes.ok) continue;
@@ -157,13 +160,12 @@ module.exports = async (req, res) => {
         const subscriber_name =
           n.full_name ||
           [n.given_name, n.surname].filter(Boolean).join(' ') ||
-          sub.subscriber?.email_address ||
-          null;
+          sub.subscriber?.email_address || null;
 
         let meta = planCache.get(sub.plan_id);
         if (!meta) {
           const pRes = await fetch(
-            ${PAYPAL_BASE}/v1/billing/plans/${sub.plan_id},
+            `${PAYPAL_BASE}/v1/billing/plans/${sub.plan_id}`,
             { headers: ppHeaders(ppToken) }
           );
           if (!pRes.ok) continue;
@@ -189,7 +191,6 @@ module.exports = async (req, res) => {
         paypalMRRCents += monthly;
         ppSubs.push({ ...sub, subscriber_name });
       }
-
       ppPage++;
     }
 
