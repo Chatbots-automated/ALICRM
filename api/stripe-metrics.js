@@ -2,8 +2,10 @@
  * Vercel Serverless Function – Stripe + PayPal subscriptions dashboard
  * Node 18 (CommonJS)
  *
- *  ▸ Stripe:   customer-expanded MRR  (unchanged)
- *  ▸ PayPal:   active subscriptions   (+ subscriber name  + MRR)
+ *  ▸ Stripe  : customer-expanded MRR  (unchanged)
+ *  ▸ PayPal  : LIVE active subscriptions (+ subscriber name  + MRR)
+ *
+ * ⚠️  HARD-CODED PayPal creds — DO NOT COMMIT TO PROD
  */
 
 const Stripe = require('stripe');
@@ -18,12 +20,17 @@ const monthStartUtc = () => {
   return Math.floor(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1) / 1000);
 };
 
-/* ---------- PayPal helpers ---------- */
-const PAYPAL_BASE = 'https://api-m.paypal.com';
+/* ---------- PayPal LIVE creds (hard-coded for test) ---------- */
+const PAYPAL_CLIENT_ID     =
+  'AacO4zdSVS1h98mUove2VbJ-B6hBwv6SVV0ofRKer0gVwgnL7cZSB4_F3PlV6bhHFaDoAk6rs3Qsw2lw';
+const PAYPAL_CLIENT_SECRET =
+  'EJIZYylz8gxmxXD5ZN4ODJP3fCP-vSi28C_7zsZdBYXx5d2VGihVryuTcxnmhVeoXL_om8T0f6G7Vro0';
+
+const PAYPAL_BASE = 'https://api-m.paypal.com';          // LIVE endpoint
 
 async function paypalToken () {
   const creds = Buffer.from(
-    `${process.env.PAYPAL_CLIENT_ID}:${process.env.PAYPAL_CLIENT_SECRET}`
+    `${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`
   ).toString('base64');
 
   const r = await fetch(`${PAYPAL_BASE}/v1/oauth2/token`, {
@@ -34,24 +41,31 @@ async function paypalToken () {
     },
     body: 'grant_type=client_credentials',
   });
-  if (!r.ok) throw new Error('PayPal token error');
+
+  if (!r.ok) {
+    const txt = await r.text();
+    console.error('PayPal OAuth error', r.status, txt);
+    throw new Error(`PayPal token error – HTTP ${r.status}`);
+  }
   const { access_token } = await r.json();
   return access_token;
 }
 
-function ppHeaders (token) {
-  return { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
-}
+const ppHeaders = token => ({
+  Authorization : `Bearer ${token}`,
+  'Content-Type': 'application/json',
+});
 
+/* ------------------------------------------------------------------ */
 module.exports = async (req, res) => {
-  /* CORS -------------------------------------------------------------- */
+  /* CORS */
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
   if (req.method === 'OPTIONS') return res.status(200).end();
 
   try {
     /* =========================================================
-       STRIPE  ▸ subscriptions  (unchanged)
+       1.  STRIPE  active subscriptions → MRR
     ========================================================= */
     let stripeMRR = 0;
     const stripeSubs = [];
@@ -88,48 +102,48 @@ module.exports = async (req, res) => {
     } while (sAfter);
 
     /* =========================================================
-       PAYPAL  ▸ active subscriptions
+       2.  PAYPAL  live active subscriptions → MRR
     ========================================================= */
     const ppToken = await paypalToken();
 
     const ppSubs   = [];
-    const planCache = new Map();  // plan_id → { amount_cents, interval_unit, interval_count }
-    let ppAfterPage = 1;
-    let ppPages = 0, ppSeen = 0;
+    const planCache = new Map();          // plan_id => meta
+    let ppPage   = 1;
+    let ppPages  = 0, ppSeen = 0;
     let paypalMRR = 0;
 
     while (true) {
-      const listURL = `${PAYPAL_BASE}/v1/billing/subscriptions` +
-        `?status=ACTIVE&page_size=20&page=${ppAfterPage}`;
+      const listURL =
+        `${PAYPAL_BASE}/v1/billing/subscriptions?status=ACTIVE&page_size=20&page=${ppPage}`;
       const listRes = await fetch(listURL, { headers: ppHeaders(ppToken) });
-      if (!listRes.ok) throw new Error('PayPal list error');
+      if (!listRes.ok) throw new Error(`PayPal list error – HTTP ${listRes.status}`);
       const listJson = await listRes.json();
 
       const batch = listJson.subscriptions ?? [];
-      if (batch.length === 0) break;           // no more pages
+      if (batch.length === 0) break;
 
-      ppPages += 1;  ppSeen += batch.length;
+      ppPages += 1; ppSeen += batch.length;
 
       for (const { id } of batch) {
-        // details call
+        /* -- subscription details -- */
         const dRes = await fetch(
           `${PAYPAL_BASE}/v1/billing/subscriptions/${id}`,
           { headers: ppHeaders(ppToken) }
         );
-        if (!dRes.ok) continue;                // skip bad ones
+        if (!dRes.ok) continue;
         const sub = await dRes.json();
 
-        // subscriber name/email
-        const nameObj = sub.subscriber?.name ?? {};
+        /* subscriber name / email */
+        const n = sub.subscriber?.name ?? {};
         const subscriber_name =
-          nameObj.full_name ||
-          [nameObj.given_name, nameObj.surname].filter(Boolean).join(' ') ||
+          n.full_name ||
+          [n.given_name, n.surname].filter(Boolean).join(' ') ||
           sub.subscriber?.email_address ||
           null;
 
-        /* ----- plan price to monthly ----- */
-        let planMeta = planCache.get(sub.plan_id);
-        if (!planMeta) {
+        /* plan meta (cache by plan_id) */
+        let meta = planCache.get(sub.plan_id);
+        if (!meta) {
           const pRes = await fetch(
             `${PAYPAL_BASE}/v1/billing/plans/${sub.plan_id}`,
             { headers: ppHeaders(ppToken) }
@@ -137,21 +151,20 @@ module.exports = async (req, res) => {
           if (!pRes.ok) continue;
           const plan = await pRes.json();
           const bc   = plan.billing_cycles?.[0];
-          const fixed = bc?.pricing_scheme?.fixed_price;
-          const freq  = bc?.frequency;
-          if (!fixed || !freq) continue;
+          const fix  = bc?.pricing_scheme?.fixed_price;
+          const freq = bc?.frequency;
+          if (!fix || !freq) continue;
 
-          const amountCents = Math.round(parseFloat(fixed.value) * 100);
-          planMeta = {
-            amount_cents  : amountCents,
-            interval_unit : freq.interval_unit,   // MONTH, YEAR, etc.
+          meta = {
+            amount_cents  : Math.round(parseFloat(fix.value) * 100),
+            interval_unit : freq.interval_unit,    // MONTH | YEAR
             interval_count: freq.interval_count,
           };
-          planCache.set(sub.plan_id, planMeta);
+          planCache.set(sub.plan_id, meta);
         }
 
-        // monthly equivalent
-        const { amount_cents, interval_unit, interval_count } = planMeta;
+        /* monthly-equivalent amount */
+        const { amount_cents, interval_unit, interval_count } = meta;
         const monthly = interval_unit === 'MONTH'
           ? amount_cents
           : amount_cents / (interval_count * (interval_unit === 'YEAR' ? 12 : 1));
@@ -160,25 +173,25 @@ module.exports = async (req, res) => {
         ppSubs.push({ ...sub, subscriber_name });
       }
 
-      ppAfterPage += 1;
+      ppPage += 1;
     }
 
     /* =========================================================
-       RESPONSE
+       3.  RESPONSE
     ========================================================= */
     const payload = {
       /* Stripe */
-      stripe_mrr_usd : toUsd(stripeMRR),
-      stripe_subscriptions: stripeSubs,
-      stripe_stats: { pages: sPages, seen: sSeen },
+      stripe_mrr_usd          : toUsd(stripeMRR),
+      stripe_subscriptions    : stripeSubs,
+      stripe_stats            : { pages: sPages, seen: sSeen },
 
       /* PayPal */
-      paypal_mrr_usd : toUsd(paypalMRR),
-      paypal_subscriptions: ppSubs,
-      paypal_stats: { pages: ppPages, seen: ppSeen },
+      paypal_mrr_usd          : toUsd(paypalMRR),
+      paypal_subscriptions    : ppSubs,
+      paypal_stats            : { pages: ppPages, seen: ppSeen },
 
       /* combined */
-      total_mrr_usd : toUsd(stripeMRR + paypalMRR),
+      total_mrr_usd           : toUsd(stripeMRR + paypalMRR),
     };
 
     console.log('Combined metrics', JSON.stringify(payload, null, 2));
