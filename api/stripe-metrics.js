@@ -1,6 +1,6 @@
 /**
- * Vercel Serverless Function – Stripe + PayPal dashboard
- * Node 18  (CommonJS)
+ * Vercel Serverless Function – Stripe + PayPal subscriptions dashboard
+ * Node 18 (CommonJS)
  *
  * ▸ Stripe  : MRR (subscriptions) + revenue (payment-intents)
  * ▸ PayPal  : LIVE active subscriptions (+ subscriber name) + MRR + revenue
@@ -11,10 +11,10 @@ const Stripe = require('stripe');
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2023-10-16' });
 
 /* ───────── helpers ───────── */
-const toUsd = c => (c / 100).toFixed(2);
-const monthStartUtc = () => Math.floor(Date.UTC(new Date().getUTCFullYear(),
-                                                new Date().getUTCMonth(), 1) / 1000);
-const iso = d => d.toISOString().slice(0, 10);
+const toUsd        = c => (c / 100).toFixed(2);
+const monthStartUtc= () => Math.floor(Date.UTC(new Date().getUTCFullYear(),
+                                               new Date().getUTCMonth(), 1) / 1000);
+const todayIso     = () => new Date().toISOString().slice(0, 10);
 
 /* ───────── PayPal creds (LIVE) ───────── */
 const PAYPAL_CLIENT_ID =
@@ -23,7 +23,7 @@ const PAYPAL_CLIENT_SECRET =
   'EJIZYylz8gxmxXD5ZN4ODJP3fCP-vSi28C_7zsZdBYXx5d2VGihVryuTcxnmhVeoXL_om8T0f6G7Vro0';
 const PAYPAL_BASE = 'https://api-m.paypal.com';
 
-/* ---------- PayPal auth ---------- */
+/* ---------- OAuth token ---------- */
 async function paypalToken () {
   const creds = Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`).toString('base64');
   const r = await fetch(`${PAYPAL_BASE}/v1/oauth2/token`, {
@@ -31,35 +31,34 @@ async function paypalToken () {
     headers: { Authorization: `Basic ${creds}`, 'Content-Type': 'application/x-www-form-urlencoded' },
     body   : 'grant_type=client_credentials',
   });
-  if (!r.ok) throw new Error(`PayPal OAuth ${r.status}`);
+  if (!r.ok) throw new Error(`PayPal token error - HTTP ${r.status}`);
   return (await r.json()).access_token;
 }
 const ppHeaders = t => ({ Authorization: `Bearer ${t}`, 'Content-Type': 'application/json' });
 
-/* ---------- PayPal gross-revenue helper ----------
-   Sums *all* transactions with a positive amount      */
+/* ---------- PayPal revenue helper (every positive transaction) ---------- */
 async function paypalRevenueCents(token, fromIso, toIso) {
   let total = 0;
-  let cursor = new Date(fromIso + 'T00:00:00Z');
-  const end  = new Date(toIso   + 'T23:59:59Z');
+  let cursor = new Date(`${fromIso}T00:00:00Z`);
+  const end  = new Date(`${toIso}T23:59:59Z`);
 
   while (cursor <= end) {
     const startIso = cursor.toISOString();
-    const stop = new Date(cursor.getUTCFullYear(), cursor.getUTCMonth() + 1, 0, 23, 59, 59);
-    const stopIso  = (stop > end ? end : stop).toISOString();
+    const monthEnd = new Date(cursor.getUTCFullYear(), cursor.getUTCMonth() + 1, 0, 23, 59, 59);
+    const stopIso  = (monthEnd > end ? end : monthEnd).toISOString();
 
     const url = `${PAYPAL_BASE}/v1/reporting/transactions`
               + `?start_date=${encodeURIComponent(startIso)}`
               + `&end_date=${encodeURIComponent(stopIso)}`
               + `&fields=all&page_size=500`;
 
-    const r = await fetch(url, { headers: ppHeaders(token) });
-    if (!r.ok) { console.warn('PayPal reporting', r.status); break; }
+    const resp = await fetch(url, { headers: ppHeaders(token) });
+    if (!resp.ok) { console.warn('PayPal reporting error', resp.status); break; }
 
-    const { transaction_details = [] } = await r.json();
+    const { transaction_details = [] } = await resp.json();
     for (const t of transaction_details) {
-      const amt = Number(t.transaction_info?.transaction_amount?.value);
-      if (Number.isFinite(amt) && amt > 0) total += Math.round(amt * 100);   // ← only positive flows
+      const val = Number(t.transaction_info?.transaction_amount?.value);
+      if (Number.isFinite(val) && val > 0) total += Math.round(val * 100);   // only positive inflow
     }
 
     cursor = new Date(cursor.getUTCFullYear(), cursor.getUTCMonth() + 1, 1); // next month
@@ -69,12 +68,12 @@ async function paypalRevenueCents(token, fromIso, toIso) {
 
 /* ───────────────────────────────────────────────────────────── */
 module.exports = async (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Origin',  '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
   if (req.method === 'OPTIONS') return res.status(200).end();
 
   try {
-    /* ========== 1. STRIPE  MRR (subscriptions) ========== */
+    /* ===== 1. STRIPE  MRR (subscriptions) ===== */
     let stripeMRR = 0, sAfter, sPages = 0, sSeen = 0;
     const stripeSubs = [];
 
@@ -95,16 +94,18 @@ module.exports = async (req, res) => {
           let cents = it.price.unit_amount;
           if (cents == null) cents = Number(it.price.unit_amount_decimal);
           if (!cents) return;
+
           const { interval, interval_count } = it.price;
           const ic = Number(interval_count) || 1;
           const monthly = interval === 'month' ? cents : cents / (ic * (interval === 'year' ? 12 : 1));
           stripeMRR += monthly * (it.quantity || 1);
         });
       });
+
       sAfter = pg.has_more ? pg.data.at(-1).id : undefined;
     } while (sAfter);
 
-    /* ========== 1B. STRIPE  revenue (PaymentIntents) ========== */
+    /* ===== 1B. STRIPE  revenue (PaymentIntents) ===== */
     const monthStart = monthStartUtc();
     let piAfter, piPages = 0, piSeen = 0, stripeAll = 0, stripeMTD = 0;
     const piSample = [];
@@ -112,17 +113,19 @@ module.exports = async (req, res) => {
     do {
       const pg = await stripe.paymentIntents.list({ limit: 1000, starting_after: piAfter });
       piPages++; piSeen += pg.data.length;
+
       pg.data.forEach(pi => {
         if (pi.status !== 'succeeded' || !pi.amount_received) return;
         if (piSample.length < 5) piSample.push(pi);
         stripeAll += pi.amount_received;
         if (pi.created >= monthStart) stripeMTD += pi.amount_received;
       });
+
       piAfter = pg.has_more ? pg.data.at(-1).id : undefined;
     } while (piAfter);
 
-    /* ========== 2. PAYPAL  MRR (active subscriptions) ========== */
-    const ppToken = await paypalToken();
+    /* ===== 2. PAYPAL  MRR (active subscriptions) ===== */
+    const ppToken   = await paypalToken();
     const planCache = new Map();
     let ppPage = 1, ppPages = 0, ppSeen = 0, paypalMRR = 0;
     const ppSubs = [];
@@ -143,8 +146,8 @@ module.exports = async (req, res) => {
         const sub = await subRes.json();
 
         const n = sub.subscriber?.name ?? {};
-        const subscriber_name = n.full_name || [n.given_name, n.surname].filter(Boolean).join(' ') ||
-                                sub.subscriber?.email_address || null;
+        const subscriber_name = n.full_name || [n.given_name, n.surname].filter(Boolean).join(' ')
+                                || sub.subscriber?.email_address || null;
 
         let meta = planCache.get(sub.plan_id);
         if (!meta) {
@@ -176,16 +179,16 @@ module.exports = async (req, res) => {
       ppPage++;
     }
 
-    /* ========== 2B. PAYPAL  revenue ========== */
-    const today = iso(new Date());
+    /* ===== 2B. PAYPAL  revenue ===== */
+    const today = todayIso();
     const paypalAll = await paypalRevenueCents(ppToken, '2010-01-01', today);
     const paypalMTD = await paypalRevenueCents(
       ppToken,
-      iso(new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), 1))),
+      today.slice(0, 8) + '01',   // first of current month
       today
     );
 
-    /* ========== RESPONSE ========== */
+    /* ===== RESPONSE ===== */
     res.status(200).json({
       /* Stripe */
       stripe_mrr_usd             : toUsd(stripeMRR),
@@ -200,8 +203,9 @@ module.exports = async (req, res) => {
       /* Combined */
       total_mrr_usd              : toUsd(stripeMRR + paypalMRR),
     });
-  } catch (e) {
-    console.error('Metrics error', e);
-    res.status(500).json({ error: e.message });
+
+  } catch (err) {
+    console.error('Metrics error', err);
+    res.status(500).json({ error: err.message });
   }
 };
