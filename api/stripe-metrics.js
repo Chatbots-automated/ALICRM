@@ -1,179 +1,149 @@
 /**
- * Vercel Serverless Function – Stripe + PayPal subscriptions dashboard
- * Node 18 (CommonJS)
+ * Vercel Serverless Function – Stripe + PayPal dashboard
+ * Node 18  (CommonJS)
  *
- *  ▸ Stripe  : MRR (subscriptions) + revenue (payment-intents)
- *  ▸ PayPal  : LIVE active subscriptions (+ subscriber name) + MRR + revenue
+ * ▸ Stripe  : MRR (subscriptions) + revenue (payment-intents)
+ * ▸ PayPal  : LIVE active subscriptions (+ subscriber name) + MRR + revenue
  *
  * ⚠️  HARD-CODED PayPal creds — FOR LOCAL TESTS ONLY
  */
 const Stripe = require('stripe');
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
-  apiVersion: '2023-10-16',
-});
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2023-10-16' });
 
 /* ───────── helpers ───────── */
-const toUsd = cents => (cents / 100).toFixed(2);
-const monthStartUtc = () => {
-  const d = new Date();
-  return Math.floor(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1) / 1000);
-};
-const todayIso = () => new Date().toISOString().slice(0, 10);
+const toUsd = c => (c / 100).toFixed(2);
+const monthStartUtc = () => Math.floor(Date.UTC(new Date().getUTCFullYear(),
+                                                new Date().getUTCMonth(), 1) / 1000);
+const iso = d => d.toISOString().slice(0, 10);
 
 /* ───────── PayPal creds (LIVE) ───────── */
 const PAYPAL_CLIENT_ID =
   'AacO4zdSVS1h98mUove2VbJ-B6hBwv6SVV0ofRKer0gVwgnL7cZSB4_F3PlV6bhHFaDoAk6rs3Qsw2lw';
 const PAYPAL_CLIENT_SECRET =
   'EJIZYylz8gxmxXD5ZN4ODJP3fCP-vSi28C_7zsZdBYXx5d2VGihVryuTcxnmhVeoXL_om8T0f6G7Vro0';
-const PAYPAL_BASE = 'https://api-m.paypal.com';        // LIVE endpoint
+const PAYPAL_BASE = 'https://api-m.paypal.com';
 
-/* ---------- OAuth token ---------- */
+/* ---------- PayPal auth ---------- */
 async function paypalToken () {
-  const creds = Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`)
-                .toString('base64');
+  const creds = Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`).toString('base64');
   const r = await fetch(`${PAYPAL_BASE}/v1/oauth2/token`, {
     method : 'POST',
-    headers: {
-      Authorization : `Basic ${creds}`,
-      'Content-Type': 'application/x-www-form-urlencoded',
-    },
-    body: 'grant_type=client_credentials',
+    headers: { Authorization: `Basic ${creds}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body   : 'grant_type=client_credentials',
   });
-  if (!r.ok) {
-    console.error('PayPal OAuth error', r.status, await r.text());
-    throw new Error(`PayPal token error — HTTP ${r.status}`);
-  }
+  if (!r.ok) throw new Error(`PayPal OAuth ${r.status}`);
   return (await r.json()).access_token;
 }
 const ppHeaders = t => ({ Authorization: `Bearer ${t}`, 'Content-Type': 'application/json' });
 
-/* ---------- PayPal revenue helper ---------- */
-async function paypalRevenueCents(token, fromIso /* YYYY-MM-DD */, toIso) {
-  const keepEvent = code => code.startsWith('T0') || code.startsWith('T1'); // money-in
-
+/* ---------- PayPal gross-revenue helper ----------
+   Sums *all* transactions with a positive amount      */
+async function paypalRevenueCents(token, fromIso, toIso) {
+  let total = 0;
   let cursor = new Date(fromIso + 'T00:00:00Z');
-  const end   = new Date(toIso   + 'T23:59:59Z');
-  let total   = 0;
+  const end  = new Date(toIso   + 'T23:59:59Z');
 
   while (cursor <= end) {
-    const start = cursor.toISOString();
-    const monthEnd = new Date(cursor.getUTCFullYear(), cursor.getUTCMonth() + 1, 0, 23, 59, 59);
-    const stop  = (monthEnd > end ? end : monthEnd).toISOString();
+    const startIso = cursor.toISOString();
+    const stop = new Date(cursor.getUTCFullYear(), cursor.getUTCMonth() + 1, 0, 23, 59, 59);
+    const stopIso  = (stop > end ? end : stop).toISOString();
 
-    const url   = `${PAYPAL_BASE}/v1/reporting/transactions`
-                + `?start_date=${encodeURIComponent(start)}`
-                + `&end_date=${encodeURIComponent(stop)}`
-                + `&fields=all&page_size=500`;
-    const resp  = await fetch(url, { headers: ppHeaders(token) });
-    if (!resp.ok) {
-      console.warn('PayPal reporting error', resp.status);
-      break; // or throw
+    const url = `${PAYPAL_BASE}/v1/reporting/transactions`
+              + `?start_date=${encodeURIComponent(startIso)}`
+              + `&end_date=${encodeURIComponent(stopIso)}`
+              + `&fields=all&page_size=500`;
+
+    const r = await fetch(url, { headers: ppHeaders(token) });
+    if (!r.ok) { console.warn('PayPal reporting', r.status); break; }
+
+    const { transaction_details = [] } = await r.json();
+    for (const t of transaction_details) {
+      const amt = Number(t.transaction_info?.transaction_amount?.value);
+      if (Number.isFinite(amt) && amt > 0) total += Math.round(amt * 100);   // ← only positive flows
     }
-    const { transaction_details = [] } = await resp.json();
-    transaction_details.forEach(t => {
-      const code = t.transaction_info?.transaction_event_code || '';
-      if (!keepEvent(code)) return;
-      const val  = Number(t.transaction_info?.transaction_amount?.value);
-      if (Number.isFinite(val)) total += Math.round(val * 100);
-    });
 
-    // move to first day of next month
-    cursor = new Date(cursor.getUTCFullYear(), cursor.getUTCMonth() + 1, 1);
+    cursor = new Date(cursor.getUTCFullYear(), cursor.getUTCMonth() + 1, 1); // next month
   }
   return total;
 }
 
 /* ───────────────────────────────────────────────────────────── */
 module.exports = async (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin',  '*');
+  res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
   if (req.method === 'OPTIONS') return res.status(200).end();
 
   try {
-    /* ========== 1. STRIPE  MRR ========== */
-    let stripeMRRCents = 0;
-    const stripeSubs   = [];
-    let sAfter, sPages = 0, sSeen = 0;
+    /* ========== 1. STRIPE  MRR (subscriptions) ========== */
+    let stripeMRR = 0, sAfter, sPages = 0, sSeen = 0;
+    const stripeSubs = [];
 
     do {
-      const page = await stripe.subscriptions.list({
-        status        : 'all',
-        limit         : 1000,           // Stripe clips to 100
-        starting_after: sAfter,
-        expand        : ['data.customer'],
+      const pg = await stripe.subscriptions.list({
+        status: 'all', limit: 1000, starting_after: sAfter, expand: ['data.customer'],
       });
+      sPages++; sSeen += pg.data.length;
 
-      sPages++;  sSeen += page.data.length;
-
-      page.data.forEach(sub => {
-        if (['canceled', 'unpaid', 'incomplete_expired'].includes(sub.status)) return;
+      pg.data.forEach(sub => {
+        if (['canceled','unpaid','incomplete_expired'].includes(sub.status)) return;
 
         const cx = sub.customer;
-        const customer_name = typeof cx === 'object' ? cx.name || cx.email || null : null;
-        stripeSubs.push({ ...sub, customer_name });
+        const name = typeof cx === 'object' ? cx.name || cx.email || null : null;
+        stripeSubs.push({ ...sub, customer_name: name });
 
         sub.items.data.forEach(it => {
           let cents = it.price.unit_amount;
           if (cents == null) cents = Number(it.price.unit_amount_decimal);
-          if (!Number.isFinite(cents) || cents === 0) return;
-
+          if (!cents) return;
           const { interval, interval_count } = it.price;
-          if (!interval) return;
           const ic = Number(interval_count) || 1;
-          const monthly = interval === 'month'
-            ? cents
-            : cents / (ic * (interval === 'year' ? 12 : 1));
-          stripeMRRCents += monthly * (it.quantity || 1);
+          const monthly = interval === 'month' ? cents : cents / (ic * (interval === 'year' ? 12 : 1));
+          stripeMRR += monthly * (it.quantity || 1);
         });
       });
-
-      sAfter = page.has_more ? page.data.at(-1).id : undefined;
+      sAfter = pg.has_more ? pg.data.at(-1).id : undefined;
     } while (sAfter);
 
     /* ========== 1B. STRIPE  revenue (PaymentIntents) ========== */
     const monthStart = monthStartUtc();
-    let piAfter, piPages = 0, piSeen = 0;
-    let stripeAllTimeC = 0, stripeMTDC = 0;
+    let piAfter, piPages = 0, piSeen = 0, stripeAll = 0, stripeMTD = 0;
     const piSample = [];
 
     do {
-      const page = await stripe.paymentIntents.list({ limit: 1000, starting_after: piAfter });
-      piPages++; piSeen += page.data.length;
-
-      page.data.forEach(pi => {
-        if (pi.status !== 'succeeded' || pi.amount_received === 0) return;
+      const pg = await stripe.paymentIntents.list({ limit: 1000, starting_after: piAfter });
+      piPages++; piSeen += pg.data.length;
+      pg.data.forEach(pi => {
+        if (pi.status !== 'succeeded' || !pi.amount_received) return;
         if (piSample.length < 5) piSample.push(pi);
-        stripeAllTimeC += pi.amount_received;
-        if (pi.created >= monthStart) stripeMTDC += pi.amount_received;
+        stripeAll += pi.amount_received;
+        if (pi.created >= monthStart) stripeMTD += pi.amount_received;
       });
-      piAfter = page.has_more ? page.data.at(-1).id : undefined;
+      piAfter = pg.has_more ? pg.data.at(-1).id : undefined;
     } while (piAfter);
 
-    /* ========== 2. PAYPAL  MRR ========== */
-    const ppToken  = await paypalToken();
-    const planCache= new Map();
-    const ppSubs   = [];
-    let ppPage = 1, ppPages = 0, ppSeen = 0;
-    let paypalMRRCents = 0;
+    /* ========== 2. PAYPAL  MRR (active subscriptions) ========== */
+    const ppToken = await paypalToken();
+    const planCache = new Map();
+    let ppPage = 1, ppPages = 0, ppSeen = 0, paypalMRR = 0;
+    const ppSubs = [];
 
     while (true) {
       const listURL = `${PAYPAL_BASE}/v1/billing/subscriptions`
                     + `?status=ACTIVE&page_size=20&page=${ppPage}`;
       const listRes = await fetch(listURL, { headers: ppHeaders(ppToken) });
-      if (!listRes.ok) throw new Error(`PayPal list error — HTTP ${listRes.status}`);
+      if (!listRes.ok) throw new Error(`PayPal list ${listRes.status}`);
       const { subscriptions: batch = [] } = await listRes.json();
-      if (batch.length === 0) break;
+      if (!batch.length) break;
 
       ppPages++; ppSeen += batch.length;
       for (const { id } of batch) {
-        const dRes = await fetch(`${PAYPAL_BASE}/v1/billing/subscriptions/${id}`,
-                                 { headers: ppHeaders(ppToken) });
-        if (!dRes.ok) continue;
-        const sub = await dRes.json();
+        const subRes = await fetch(`${PAYPAL_BASE}/v1/billing/subscriptions/${id}`,
+                                   { headers: ppHeaders(ppToken) });
+        if (!subRes.ok) continue;
+        const sub = await subRes.json();
 
         const n = sub.subscriber?.name ?? {};
-        const subscriber_name = n.full_name ||
-                                [n.given_name, n.surname].filter(Boolean).join(' ') ||
+        const subscriber_name = n.full_name || [n.given_name, n.surname].filter(Boolean).join(' ') ||
                                 sub.subscriber?.email_address || null;
 
         let meta = planCache.get(sub.plan_id);
@@ -189,7 +159,7 @@ module.exports = async (req, res) => {
 
           meta = {
             amount_cents  : Math.round(parseFloat(fix.value) * 100),
-            interval_unit : freq.interval_unit,   // MONTH | YEAR
+            interval_unit : freq.interval_unit,
             interval_count: freq.interval_count,
           };
           planCache.set(sub.plan_id, meta);
@@ -199,52 +169,39 @@ module.exports = async (req, res) => {
         const monthly = interval_unit === 'MONTH'
           ? amount_cents
           : amount_cents / (interval_count * (interval_unit === 'YEAR' ? 12 : 1));
-        paypalMRRCents += monthly;
 
+        paypalMRR += monthly;
         ppSubs.push({ ...sub, subscriber_name });
       }
       ppPage++;
     }
 
-    /* ========== 2B. PAYPAL  revenue (transaction search) ========== */
-    const paypalAllTimeC = await paypalRevenueCents(ppToken, '2010-01-01', todayIso());
-    const paypalMTDC     = await paypalRevenueCents(
-                              ppToken,
-                              new Date(Date.UTC(new Date().getUTCFullYear(),
-                                                new Date().getUTCMonth(), 1))
-                              .toISOString().slice(0,10),
-                              todayIso()
-                            );
+    /* ========== 2B. PAYPAL  revenue ========== */
+    const today = iso(new Date());
+    const paypalAll = await paypalRevenueCents(ppToken, '2010-01-01', today);
+    const paypalMTD = await paypalRevenueCents(
+      ppToken,
+      iso(new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), 1))),
+      today
+    );
 
-    /* ========== 3. RESPONSE ========== */
-    const payload = {
+    /* ========== RESPONSE ========== */
+    res.status(200).json({
       /* Stripe */
-      stripe_mrr_usd             : toUsd(stripeMRRCents),
-      stripe_revenue_all_time_usd: toUsd(stripeAllTimeC),
-      stripe_revenue_mtd_usd     : toUsd(stripeMTDC),
-      stripe_subscriptions       : stripeSubs,
-      payment_intents_sample     : piSample,
-      stripe_stats               : {
-        subs_pages: sPages, subs_seen: sSeen,
-        pi_pages  : piPages, pi_seen : piSeen,
-      },
+      stripe_mrr_usd             : toUsd(stripeMRR),
+      stripe_revenue_all_time_usd: toUsd(stripeAll),
+      stripe_revenue_mtd_usd     : toUsd(stripeMTD),
 
       /* PayPal */
-      paypal_mrr_usd             : toUsd(paypalMRRCents),
-      paypal_revenue_all_time_usd: toUsd(paypalAllTimeC),
-      paypal_revenue_mtd_usd     : toUsd(paypalMTDC),
-      paypal_subscriptions       : ppSubs,
-      paypal_stats               : { pages: ppPages, seen: ppSeen },
+      paypal_mrr_usd             : toUsd(paypalMRR),
+      paypal_revenue_all_time_usd: toUsd(paypalAll),
+      paypal_revenue_mtd_usd     : toUsd(paypalMTD),
 
       /* Combined */
-      total_mrr_usd              : toUsd(stripeMRRCents + paypalMRRCents),
-    };
-
-    console.log('Combined metrics', JSON.stringify(payload, null, 2));
-    res.status(200).json(payload);
-
-  } catch (err) {
-    console.error('Metrics error', err);
-    res.status(500).json({ error: err.message });
+      total_mrr_usd              : toUsd(stripeMRR + paypalMRR),
+    });
+  } catch (e) {
+    console.error('Metrics error', e);
+    res.status(500).json({ error: e.message });
   }
 };
