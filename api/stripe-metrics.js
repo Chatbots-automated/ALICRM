@@ -3,7 +3,7 @@
  * Node 18 (CommonJS)
  *
  *  ▸ Stripe  : MRR (subscriptions) + revenue (payment-intents)
- *  ▸ PayPal  : LIVE active subscriptions (subscriber name) + MRR
+ *  ▸ PayPal  : LIVE active subscriptions (+ subscriber name) + MRR
  *
  * ⚠️  HARD-CODED PayPal creds — FOR LOCAL TESTS ONLY
  */
@@ -34,7 +34,7 @@ async function paypalToken() {
   ).toString('base64');
 
   const r = await fetch(`${PAYPAL_BASE}/v1/oauth2/token`, {
-    method: 'POST',
+    method : 'POST',
     headers: {
       Authorization : `Basic ${creds}`,
       'Content-Type': 'application/x-www-form-urlencoded',
@@ -43,18 +43,14 @@ async function paypalToken() {
   });
 
   if (!r.ok) {
-    const txt = await r.text();
-    console.error('PayPal OAuth error', r.status, txt);
+    console.error('PayPal OAuth error', r.status, await r.text());
     throw new Error(`PayPal token error — HTTP ${r.status}`);
   }
   const { access_token } = await r.json();
   return access_token;
 }
 
-const ppHeaders = token => ({
-  Authorization : `Bearer ${token}`,
-  'Content-Type': 'application/json',
-});
+const ppHeaders = t => ({ Authorization: `Bearer ${t}`, 'Content-Type': 'application/json' });
 
 /* ───────────────────────────────────────────────────────────── */
 module.exports = async (req, res) => {
@@ -63,7 +59,7 @@ module.exports = async (req, res) => {
   if (req.method === 'OPTIONS') return res.status(200).end();
 
   try {
-    /* ========== 1. STRIPE MRR (subscriptions) ========== */
+    /* ========== 1. STRIPE  MRR (subscriptions) ========== */
     let stripeMRRCents = 0;
     const stripeSubs   = [];
     let sAfter, sPages = 0, sSeen = 0;
@@ -88,14 +84,18 @@ module.exports = async (req, res) => {
         stripeSubs.push({ ...sub, customer_name });
 
         sub.items.data.forEach(it => {
-          const cents = it.price.unit_amount ??
-                        Math.round(parseFloat(it.price.unit_amount_decimal || 0));
-          if (!cents) return;
+          /* — sanitize amount — */
+          let cents = it.price.unit_amount;
+          if (cents == null) cents = Number(it.price.unit_amount_decimal);
+          if (!Number.isFinite(cents) || cents === 0) return;       // skip free / bad
 
           const { interval, interval_count } = it.price;
+          if (!interval) return;                                     // defensive
+
+          const ic = Number(interval_count) || 1;                    // guard divide-by-0
           const monthly = interval === 'month'
             ? cents
-            : cents / (interval_count * (interval === 'year' ? 12 : 1));
+            : cents / (ic * (interval === 'year' ? 12 : 1));
 
           stripeMRRCents += monthly * (it.quantity || 1);
         });
@@ -104,7 +104,7 @@ module.exports = async (req, res) => {
       sAfter = page.has_more ? page.data.at(-1).id : undefined;
     } while (sAfter);
 
-    /* ========== 1B. STRIPE revenue (PaymentIntents) ========== */
+    /* ========== 1B. STRIPE  revenue (PaymentIntents) ========== */
     const monthStart = monthStartUtc();
     let piAfter, piPages = 0, piSeen = 0;
     let stripeAllTimeC = 0, stripeMTDC = 0;
@@ -121,7 +121,6 @@ module.exports = async (req, res) => {
       page.data.forEach(pi => {
         if (pi.status !== 'succeeded' || pi.amount_received === 0) return;
         if (piSample.length < 5) piSample.push(pi);
-
         stripeAllTimeC += pi.amount_received;
         if (pi.created >= monthStart) stripeMTDC += pi.amount_received;
       });
@@ -129,10 +128,10 @@ module.exports = async (req, res) => {
       piAfter = page.has_more ? page.data.at(-1).id : undefined;
     } while (piAfter);
 
-    /* ========== 2. PAYPAL active subscriptions → MRR ========== */
-    const ppToken     = await paypalToken();
-    const planCache   = new Map();
-    const ppSubs      = [];
+    /* ========== 2. PAYPAL  active subscriptions → MRR ========== */
+    const ppToken        = await paypalToken();
+    const planCache      = new Map();
+    const ppSubs         = [];
     let ppPage = 1, ppPages = 0, ppSeen = 0;
     let paypalMRRCents = 0;
 
@@ -144,7 +143,7 @@ module.exports = async (req, res) => {
       const { subscriptions: batch = [] } = await listRes.json();
       if (batch.length === 0) break;
 
-      ppPages++;  ppSeen += batch.length;
+      ppPages++; ppSeen += batch.length;
 
       for (const { id } of batch) {
         const dRes = await fetch(
@@ -168,10 +167,10 @@ module.exports = async (req, res) => {
             { headers: ppHeaders(ppToken) }
           );
           if (!pRes.ok) continue;
-          const plan  = await pRes.json();
-          const bc    = plan.billing_cycles?.[0];
-          const fix   = bc?.pricing_scheme?.fixed_price;
-          const freq  = bc?.frequency;
+          const plan = await pRes.json();
+          const bc   = plan.billing_cycles?.[0];
+          const fix  = bc?.pricing_scheme?.fixed_price;
+          const freq = bc?.frequency;
           if (!fix || !freq) continue;
 
           meta = {
